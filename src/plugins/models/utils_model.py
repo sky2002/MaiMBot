@@ -352,8 +352,8 @@ class LLMRequest:
         raise RuntimeError(f"模型 {self.model_name} 达到最大重试次数，API请求仍然失败")
 
     async def _execute_gemini_response(self, payload: dict = None, user_id: str = "system", request_type: str = None):
-        tools_payload=payload.get("tools")
-        gemini_tools=None
+        tools_payload = payload.get("tools")
+        gemini_tools = None
         if tools_payload and isinstance(tools_payload, list):
             try:
                 function_declarations = []
@@ -363,7 +363,9 @@ class LLMRequest:
                         declaration = types.FunctionDeclaration(
                             name=func_data["name"],
                             description=func_data["description"],
-                            parameters=func_data["parameters"], # Assuming your parameters directly match Gemini's required schema
+                            parameters=func_data[
+                                "parameters"
+                            ],  # Assuming your parameters directly match Gemini's required schema
                         )
                         function_declarations.append(declaration)
                     else:
@@ -381,7 +383,7 @@ class LLMRequest:
             "max_output_tokens": payload.get("max_tokens", global_config.model_max_output_length),
             "temperature": payload.get("temperature", 0.7),
             "response_modalities": ["TEXT"],
-            "thinking_config": types.ThinkingConfig(thinking_budget=0)
+            "thinking_config": types.ThinkingConfig(thinking_budget=0),
         }
         # Add tool_config if it was created
         if gemini_tools:
@@ -410,18 +412,23 @@ class LLMRequest:
                 if finish_reason_enum not in [types.FinishReason.STOP, types.FinishReason.MAX_TOKENS]:
                     logger.warning(f"Gemini生成停止，原因：{finish_reason_str}")
                     if finish_reason_enum == types.FinishReason.SAFETY:
-                        safety_ratings_str = "，".join([f"{rating.category.name}: {rating.probability.name}" for rating in candidate.safety_ratings])
+                        safety_ratings_str = "，".join(
+                            [
+                                f"{rating.category.name}: {rating.probability.name}"
+                                for rating in candidate.safety_ratings
+                            ]
+                        )
                         logger.error(f"Gemini安全设置组织了回答，安全评分: {safety_ratings_str}")
                 try:
-                    text_content=response.text
+                    text_content = response.text
                 except ValueError:
-                    logger.info("响应中没有文本内容，可能只有函数调用。")    
-                    text_content=""
+                    logger.info("响应中没有文本内容，可能只有函数调用。")
+                    text_content = ""
                 if candidate.content and candidate.content.parts:
                     collected_function_calls = []
                     for part in candidate.content.parts:
                         if part.function_call:
-                            collected_function_calls.append(part.function_call) # 直接附加对象
+                            collected_function_calls.append(part.function_call)  # 直接附加对象
                             logger.debug(f"Gemini function call调用：{part.function_call}")
                             fc = 1
                     if fc == 1:
@@ -447,15 +454,22 @@ class LLMRequest:
                     return text_content, ""
             else:
                 block_reason = response.prompt_feedback.block_reason.name if response.prompt_feedback else "未知"
-                block_reason_msg = response.prompt_feedback.block_reason_message if response.prompt_feedback else "无具体信息"
+                block_reason_msg = (
+                    response.prompt_feedback.block_reason_message if response.prompt_feedback else "无具体信息"
+                )
                 logger.warning(f"Gemini回复中没有candidate。可能原因: {block_reason}. 信息: {block_reason_msg}")
                 if response.prompt_feedback and response.prompt_feedback.block_reason == types.BlockReason.SAFETY:
-                    safety_ratings_str = ", ".join([f"{rating.category.name}: {rating.probability.name}" for rating in response.prompt_feedback.safety_ratings])
+                    safety_ratings_str = ", ".join(
+                        [
+                            f"{rating.category.name}: {rating.probability.name}"
+                            for rating in response.prompt_feedback.safety_ratings
+                        ]
+                    )
                     logger.error(f"Gemini因Prompt安全问题阻止了请求。安全评分: {safety_ratings_str}")
                     return f"请求因安全原因被阻止 ({safety_ratings_str})", None
                 return f"未从Gemini收到有效候选回复 (原因: {block_reason})", None
         except Exception as e:
-            response_str = str(response) if 'response' in locals() else "响应对象不可用"
+            response_str = str(response) if "response" in locals() else "响应对象不可用"
             logger.error(
                 f"处理Gemini响应时发生意外错误: {e}. Payload: {payload}, Response: {response_str}", exc_info=True
             )
@@ -791,7 +805,7 @@ class LLMRequest:
         if self.model_name.lower() in self.MODELS_NEEDING_TRANSFORMATION and "max_tokens" in payload:
             payload["max_completion_tokens"] = payload.pop("max_tokens")
         return payload
-    
+
     async def _build_gemini_payload(self, prompt: str) -> dict:
         messages = [{"role": "user", "content": prompt}]
         payload = {"model": self.model_name, "messages": messages, **self.params}
