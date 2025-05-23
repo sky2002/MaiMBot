@@ -6,6 +6,8 @@ from typing import Tuple, Union, Dict, Any
 
 import aiohttp
 from aiohttp.client import ClientResponse
+from google import genai
+from google.genai import types
 
 from src.common.logger import get_module_logger
 import base64
@@ -119,7 +121,9 @@ class LLMRequest:
             raise ValueError(f"配置错误：找不到对应的配置项 - {str(e)}") from e
         self.model_name: str = model["name"]
         self.params = kwargs
-
+        self.is_gemini = "gemini" in self.model_name.lower()
+        if self.is_gemini:
+            self.client = genai.Client(api_key=self.api_key)
         self.stream = model.get("stream", False)
         self.pri_in = model.get("pri_in", 0)
         self.pri_out = model.get("pri_out", 0)
@@ -255,6 +259,35 @@ class LLMRequest:
             "prompt": prompt,
         }
 
+    async def _prepare_gemini_request(
+        self,
+        prompt: str = None,
+        image_base64: str = None,
+        image_format: str = None,
+        payload: dict = None,
+        retry_policy: dict = None,
+    ) -> Dict[str, Any]:
+        default_retry = {
+            "max_retries": 3,
+            "base_wait": 10,
+            "retry_codes": [429, 413, 500, 503],
+            "abort_codes": [400, 401, 402, 403],
+        }
+        policy = {**default_retry, **(retry_policy or {})}
+
+        if payload is None:
+            payload = await self._build_gemini_payload(prompt)
+
+        return {
+            "policy": policy,
+            "payload": payload,
+            "api_url": "none",
+            "stream_mode": "false",
+            "image_base64": image_base64,  # 保留必要的exception处理所需的原始数据
+            "image_format": image_format,
+            "prompt": prompt,
+        }
+
     async def _execute_request(
         self,
         endpoint: str,
@@ -280,13 +313,20 @@ class LLMRequest:
             request_type: 请求类型
         """
         # 获取请求配置
-        request_content = await self._prepare_request(
-            endpoint, prompt, image_base64, image_format, payload, retry_policy
-        )
+        if self.is_gemini:
+            request_content = await self._prepare_gemini_request(
+                prompt, image_base64, image_format, payload, retry_policy
+            )
+        else:
+            request_content = await self._prepare_request(
+                endpoint, prompt, image_base64, image_format, payload, retry_policy
+            )
         if request_type is None:
             request_type = self.request_type
         for retry in range(request_content["policy"]["max_retries"]):
             try:
+                if self.is_gemini:
+                    return await self._execute_gemini_response(request_content["payload"], user_id, request_type)
                 # 使用上下文管理器处理会话
                 headers = await self._build_headers()
                 # 似乎是openai流式必须要的东西,不过阿里云的qwq-plus加了这个没有影响
@@ -310,6 +350,116 @@ class LLMRequest:
 
         logger.error(f"模型 {self.model_name} 达到最大重试次数，请求仍然失败")
         raise RuntimeError(f"模型 {self.model_name} 达到最大重试次数，API请求仍然失败")
+
+    async def _execute_gemini_response(self, payload: dict = None, user_id: str = "system", request_type: str = None):
+        tools_payload=payload.get("tools")
+        gemini_tools=None
+        if tools_payload and isinstance(tools_payload, list):
+            try:
+                function_declarations = []
+                for tool_definition in tools_payload:
+                    if tool_definition.get("type") == "function" and "function" in tool_definition:
+                        func_data = tool_definition["function"]
+                        declaration = types.FunctionDeclaration(
+                            name=func_data["name"],
+                            description=func_data["description"],
+                            parameters=func_data["parameters"], # Assuming your parameters directly match Gemini's required schema
+                        )
+                        function_declarations.append(declaration)
+                    else:
+                        logger.warning(f"跳过不正确工具: {tool_definition}")
+                if function_declarations:
+                    gemini_tools = [types.Tool(function_declarations=function_declarations)]
+                    logger.debug(f"已准备向Gemini API发送 {len(function_declarations)} 个工具。")
+                else:
+                    logger.debug("提供了工具，但是没有有效定义")
+            except Exception as e:
+                logger.error(f"Error processing tools payload for Gemini: {e}", exc_info=True)
+                # Decide if you want to proceed without tools or raise an error
+                gemini_tools = None
+        generation_config_dict = {
+            "max_output_tokens": payload.get("max_tokens", global_config.model_max_output_length),
+            "temperature": payload.get("temperature", 0.7),
+            "response_modalities": ["TEXT"],
+            "thinking_config": types.ThinkingConfig(thinking_budget=0)
+        }
+        # Add tool_config if it was created
+        if gemini_tools:
+            generation_config_dict["tools"] = gemini_tools
+
+        # Create the GenerationConfig object
+        generation_config = types.GenerateContentConfig(**generation_config_dict)
+        if gemini_tools:
+            response = await self.client.aio.models.generate_content(
+                model=payload["model"],
+                contents=payload["messages"][-1]["content"],
+                config=generation_config,
+            )
+        else:
+            response = await self.client.aio.models.generate_content(
+                model=payload["model"],
+                contents=payload["messages"][-1]["content"],
+                config=generation_config,
+            )
+        fc = 0
+        try:
+            if response.candidates:
+                candidate = response.candidates[0]
+                finish_reason_enum = candidate.finish_reason
+                finish_reason_str = finish_reason_enum.name
+                if finish_reason_enum not in [types.FinishReason.STOP, types.FinishReason.MAX_TOKENS]:
+                    logger.warning(f"Gemini生成停止，原因：{finish_reason_str}")
+                    if finish_reason_enum == types.FinishReason.SAFETY:
+                        safety_ratings_str = "，".join([f"{rating.category.name}: {rating.probability.name}" for rating in candidate.safety_ratings])
+                        logger.error(f"Gemini安全设置组织了回答，安全评分: {safety_ratings_str}")
+                try:
+                    text_content=response.text
+                except ValueError:
+                    logger.info("响应中没有文本内容，可能只有函数调用。")    
+                    text_content=""
+                if candidate.content and candidate.content.parts:
+                    collected_function_calls = []
+                    for part in candidate.content.parts:
+                        if part.function_call:
+                            collected_function_calls.append(part.function_call) # 直接附加对象
+                            logger.debug(f"Gemini function call调用：{part.function_call}")
+                            fc = 1
+                    if fc == 1:
+                        function_calls = collected_function_calls
+                if response.usage_metadata:
+                    usage = response.usage_metadata
+                    prompt_tokens = usage.prompt_token_count
+                    completion_tokens = usage.candidates_token_count
+                    total_tokens = usage.total_token_count
+                    self._record_usage(
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        total_tokens=total_tokens,
+                        user_id=user_id,
+                        request_type=request_type if request_type is not None else self.request_type,
+                        endpoint="/chat/completions",
+                    )
+                else:
+                    logger.warning("Gemini回复中没有用量信息")
+                if fc == 1:
+                    return text_content, "", function_calls
+                else:
+                    return text_content, ""
+            else:
+                block_reason = response.prompt_feedback.block_reason.name if response.prompt_feedback else "未知"
+                block_reason_msg = response.prompt_feedback.block_reason_message if response.prompt_feedback else "无具体信息"
+                logger.warning(f"Gemini回复中没有candidate。可能原因: {block_reason}. 信息: {block_reason_msg}")
+                if response.prompt_feedback and response.prompt_feedback.block_reason == types.BlockReason.SAFETY:
+                    safety_ratings_str = ", ".join([f"{rating.category.name}: {rating.probability.name}" for rating in response.prompt_feedback.safety_ratings])
+                    logger.error(f"Gemini因Prompt安全问题阻止了请求。安全评分: {safety_ratings_str}")
+                    return f"请求因安全原因被阻止 ({safety_ratings_str})", None
+                return f"未从Gemini收到有效候选回复 (原因: {block_reason})", None
+        except Exception as e:
+            response_str = str(response) if 'response' in locals() else "响应对象不可用"
+            logger.error(
+                f"处理Gemini响应时发生意外错误: {e}. Payload: {payload}, Response: {response_str}", exc_info=True
+            )
+            return f"处理Gemini响应时出错: {e}", None
 
     async def _handle_response(
         self,
@@ -641,6 +791,15 @@ class LLMRequest:
         if self.model_name.lower() in self.MODELS_NEEDING_TRANSFORMATION and "max_tokens" in payload:
             payload["max_completion_tokens"] = payload.pop("max_tokens")
         return payload
+    
+    async def _build_gemini_payload(self, prompt: str) -> dict:
+        messages = [{"role": "user", "content": prompt}]
+        payload = {"model": self.model_name, "messages": messages, **self.params}
+        if "max_tokens" not in payload and "max_completion_tokens" not in payload:
+            payload["max_tokens"] = global_config.model_max_output_length
+        if "temperature" not in payload:
+            payload["temperature"] = 0.7
+        return payload
 
     def _default_response_handler(
         self, result: dict, user_id: str = "system", request_type: str = None, endpoint: str = "/chat/completions"
@@ -737,8 +896,10 @@ class LLMRequest:
             **self.params,
             **kwargs,
         }
-
-        response = await self._execute_request(endpoint="/chat/completions", payload=data, prompt=prompt)
+        if self.is_gemini:
+            response = await self._execute_request(endpoint="gemini", payload=data, prompt=prompt)
+        else:
+            response = await self._execute_request(endpoint="/chat/completions", payload=data, prompt=prompt)
         # 原样返回响应，不做处理
 
         return response
